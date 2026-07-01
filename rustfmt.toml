@@ -1,0 +1,31 @@
+# most of the settings one would actually want to use are unstable...
+# - option to control imports wrapping is unstable
+# - option to separate imports by item is unstable
+# - option to control trailing commas is unstable
+# - option to place binops at end of previous line is unstable
+# - option to place very short attributes on the same line
+# - option to wrap match arms to a new line without using a block
+# - option to allow wrapping just the last expression in a function call
+# - option to control grouping of imports
+# - option to put short `where` clauses on a single line
+
+#unstable_features = true
+#imports_layout = "Horizontal"
+#imports_granularity = "Item"
+#trailing_comma = "Never"
+#binop_separator = "Back"
+#inline_attribute_width = 50
+#match_arm_blocks = false
+#overflow_delimited_expr = true
+#group_imports = "StdExternalCrate"
+#where_single_line = true
+
+max_width = 140
+attr_fn_like_width = 120
+chain_width = 120
+fn_call_width = 100
+newline_style = "Native"
+short_array_element_width_threshold = 10
+struct_lit_width = 60
+use_field_init_shorthand = true
+use_try_shorthand = true
