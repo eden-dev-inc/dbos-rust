@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust SDK surface for DBOS durable workflows."
 readme = "README.md"
+license = "MIT"
 
 [lib]
 name = "dbos"

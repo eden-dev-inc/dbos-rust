@@ -28,3 +28,7 @@ cargo test --workspace --all-features
 ```
 
 Chaos tests are opt-in because they require an external Postgres instance and restart commands. See [`docs/chaos-tests.md`](docs/chaos-tests.md).
+
+## License
+
+MIT
