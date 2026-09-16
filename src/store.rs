@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "turso"))]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use crate::types::{
 #[async_trait]
 pub trait SystemDatabase: Send + Sync {
     async fn migrate(&self) -> Result<()>;
+    /// Atomically inserts a workflow, accepting an existing row only when its name and serialized input match exactly.
     async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()>;
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()>;
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowStatus>>;
@@ -134,13 +135,7 @@ impl SystemDatabase for MemoryStore {
     async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
         let mut data = self.data.write().await;
         if let Some(existing) = data.workflows.get(&workflow.workflow_uuid) {
-            if existing.name != workflow.name || existing.input != workflow.input {
-                return Err(DbosError::new(
-                    crate::error::DbosErrorCode::ConflictingWorkflow,
-                    format!("conflicting workflow invocation with the same ID ({})", workflow.workflow_uuid),
-                ));
-            }
-            return Ok(());
+            return ensure_workflow_identity_matches(existing, &workflow);
         }
         if let (Some(queue), Some(dedup)) = (&workflow.queue_name, &workflow.deduplication_id) {
             let duplicate = data.workflows.values().any(|item| {
@@ -360,6 +355,21 @@ impl SystemDatabase for MemoryStore {
     async fn get_patch(&self, patch_name: &str) -> Result<Option<bool>> {
         Ok(self.data.read().await.patches.get(patch_name).copied())
     }
+}
+
+fn ensure_workflow_identity_matches(existing: &WorkflowStatus, requested: &WorkflowStatus) -> Result<()> {
+    if existing.name == requested.name && existing.input == requested.input {
+        return Ok(());
+    }
+    Err(DbosError::new(
+        crate::error::DbosErrorCode::ConflictingWorkflow,
+        format!("conflicting workflow invocation with the same ID ({})", requested.workflow_uuid),
+    ))
+}
+
+#[cfg(feature = "turso")]
+fn is_retryable_turso_insert_error(error: &turso::Error) -> bool {
+    matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 }
 
 fn workflow_matches(workflow: &WorkflowStatus, options: &ListWorkflowsOptions) -> bool {
@@ -735,13 +745,48 @@ impl SystemDatabase for PostgresStore {
     }
 
     async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
-        if self.get_workflow(&workflow.workflow_uuid).await?.is_some() {
-            return Err(DbosError::new(
-                crate::error::DbosErrorCode::ConflictingWorkflow,
-                format!("conflicting workflow invocation with the same ID ({})", workflow.workflow_uuid),
-            ));
+        let payload = serde_json::to_value(&workflow)?;
+        let insert_query = format!(
+            "INSERT INTO {} (kind, id, payload, updated_at) VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (kind, id) DO NOTHING",
+            self.state_table()
+        );
+        let select_query = format!("SELECT payload FROM {} WHERE kind = $1 AND id = $2", self.state_table());
+        for attempt in 0..2 {
+            let mut client = self.client.lock().await;
+            self.ensure_connected_locked(&mut client).await?;
+            let Some(client_ref) = client.as_ref() else {
+                return Err(DbosError::database("postgres client was not initialized"));
+            };
+            let result: std::result::Result<(bool, Option<Value>), tokio_postgres::Error> = async {
+                let inserted = client_ref.execute(&insert_query, &[&"workflow", &workflow.workflow_uuid, &payload]).await?;
+                if inserted > 0 {
+                    return Ok((true, None));
+                }
+                let existing = client_ref.query_opt(&select_query, &[&"workflow", &workflow.workflow_uuid]).await?;
+                Ok((false, existing.map(|row| row.get(0))))
+            }
+            .await;
+            match result {
+                Ok((true, _)) => return Ok(()),
+                Ok((false, Some(existing_payload))) => {
+                    let existing = serde_json::from_value(existing_payload)?;
+                    return ensure_workflow_identity_matches(&existing, &workflow);
+                }
+                Ok((false, None)) => {
+                    return Err(DbosError::database(format!(
+                        "workflow {} disappeared after a postgres insert conflict",
+                        workflow.workflow_uuid
+                    )));
+                }
+                Err(error) if attempt == 0 => {
+                    log_database_warning("retrying DBOS postgres workflow insert after connection failure", &error);
+                    *client = None;
+                }
+                Err(error) => return Err(DbosError::from(error)),
+            }
         }
-        self.put("workflow", &workflow.workflow_uuid, &workflow).await
+        Err(DbosError::database("postgres workflow insert retry loop exited unexpectedly"))
     }
 
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
@@ -1059,13 +1104,56 @@ impl SystemDatabase for TursoStore {
     }
 
     async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
-        if self.get_workflow(&workflow.workflow_uuid).await?.is_some() {
-            return Err(DbosError::new(
-                crate::error::DbosErrorCode::ConflictingWorkflow,
-                format!("conflicting workflow invocation with the same ID ({})", workflow.workflow_uuid),
-            ));
+        let payload = serde_json::to_string(&workflow)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut delay = Duration::from_millis(1);
+        loop {
+            let result: std::result::Result<(bool, Option<String>), turso::Error> = {
+                let connection = self.connection.lock().await;
+                async {
+                    let inserted = connection
+                        .execute(
+                            "INSERT INTO dbos_state (kind, id, payload, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) \
+                             ON CONFLICT (kind, id) DO NOTHING",
+                            turso::params!["workflow", workflow.workflow_uuid.as_str(), payload.as_str()],
+                        )
+                        .await?;
+                    if inserted > 0 {
+                        return Ok((true, None));
+                    }
+                    let mut rows = connection
+                        .query(
+                            "SELECT payload FROM dbos_state WHERE kind = ?1 AND id = ?2",
+                            turso::params!["workflow", workflow.workflow_uuid.as_str()],
+                        )
+                        .await?;
+                    let existing = match rows.next().await? {
+                        Some(row) => Some(row.get::<String>(0)?),
+                        None => None,
+                    };
+                    Ok((false, existing))
+                }
+                .await
+            };
+            match result {
+                Ok((true, _)) => return Ok(()),
+                Ok((false, Some(existing_payload))) => {
+                    let existing = serde_json::from_str(&existing_payload)?;
+                    return ensure_workflow_identity_matches(&existing, &workflow);
+                }
+                Ok((false, None)) => {
+                    return Err(DbosError::database(format!(
+                        "workflow {} disappeared after a turso insert conflict",
+                        workflow.workflow_uuid
+                    )));
+                }
+                Err(error) if is_retryable_turso_insert_error(&error) && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                }
+                Err(error) => return Err(DbosError::from(error)),
+            }
         }
-        self.put("workflow", &workflow.workflow_uuid, &workflow).await
     }
 
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
@@ -1363,3 +1451,7 @@ pub(crate) fn step_counts_by_name(rows: &[StepInfo]) -> Vec<crate::types::StepAg
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+mod tests;
