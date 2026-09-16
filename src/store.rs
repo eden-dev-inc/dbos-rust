@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 #[cfg(any(feature = "postgres", feature = "turso"))]
 use serde::Serialize;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "turso"))]
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "turso"))]
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
