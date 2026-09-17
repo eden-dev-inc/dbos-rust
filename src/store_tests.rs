@@ -9,7 +9,9 @@ use uuid::Uuid;
 use super::*;
 use crate::error::DbosErrorCode;
 use crate::types::WorkflowStatusType;
-use crate::{DbosConfig, DbosContext, JsonSerializer, StepInfo, WorkflowExport, WorkflowOptions, WorkflowRegistrationOptions};
+use crate::{
+    DbosConfig, DbosContext, ForkWorkflowInput, JsonSerializer, StepInfo, WorkflowExport, WorkflowOptions, WorkflowRegistrationOptions,
+};
 
 const CONCURRENT_CLIENTS: usize = 8;
 
@@ -190,13 +192,32 @@ async fn exercise_concurrent_immutable_winner(stores: &[Arc<dyn SystemDatabase>]
     ensure_workflow_unchanged(primary, &workflow_id, &expected).await
 }
 
+async fn exercise_execution_claim_retry(store: &Arc<dyn SystemDatabase>) -> Result<()> {
+    let workflow_id = format!("claim-retry-{}", Uuid::new_v4());
+    store.insert_workflow(workflow(&workflow_id, "claim-retry-workflow", json!({"request": "same"}))).await?;
+    if !store.claim_workflow_execution(&workflow_id, "executor-a", "claim-a").await? {
+        return Err(test_error("initial execution claim was not granted"));
+    }
+    if load_workflow(store, &workflow_id).await?.status != WorkflowStatusType::Pending {
+        return Err(test_error("execution claim did not atomically transition the workflow to pending"));
+    }
+    if !store.claim_workflow_execution(&workflow_id, "executor-a", "claim-a").await? {
+        return Err(test_error("retry of the same execution claim was not recognized"));
+    }
+    if store.claim_workflow_execution(&workflow_id, "executor-a", "claim-b").await? {
+        return Err(test_error("a distinct execution claim was granted after the durable winner"));
+    }
+    Ok(())
+}
+
 async fn exercise_store(stores: Vec<Arc<dyn SystemDatabase>>) -> Result<()> {
     let Some(primary) = stores.first() else {
         return Err(test_error("store test requires at least one store"));
     };
     exercise_exact_retry_and_mismatches(primary).await?;
     exercise_concurrent_exact_retry(&stores).await?;
-    exercise_concurrent_immutable_winner(&stores).await
+    exercise_concurrent_immutable_winner(&stores).await?;
+    exercise_execution_claim_retry(primary).await
 }
 
 async fn exercise_concurrent_workflow_execution(stores: Vec<Arc<dyn SystemDatabase>>) -> Result<()> {
@@ -359,6 +380,99 @@ async fn exercise_recovery_of_unclaimed_workflow(store: Arc<dyn SystemDatabase>)
     Ok(())
 }
 
+async fn exercise_recovery_of_claimed_enqueued_workflow(store: Arc<dyn SystemDatabase>) -> Result<()> {
+    let workflow_id = format!("claimed-enqueued-recovery-{}", Uuid::new_v4());
+    let workflow_name = "claimed-enqueued-recovery-workflow";
+    let mut workflow = WorkflowStatus::new(&workflow_id, workflow_name, "test-version", crate::serialization::DBOS_JSON);
+    workflow.status = WorkflowStatusType::Enqueued;
+    workflow.input = stored_workflow_input(41)?;
+    store.insert_workflow(workflow).await?;
+    if !store.claim_workflow_execution(&workflow_id, "local", "pre-crash-claim").await? {
+        return Err(test_error("pre-crash enqueued workflow claim was not granted"));
+    }
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let ctx =
+        DbosContext::new(DbosConfig::new("claimed-enqueued-recovery").with_system_database(SystemDatabaseHandle::from_arc(store))).await?;
+    let handler_executions = Arc::clone(&executions);
+    ctx.register_workflow(
+        workflow_name,
+        move |_ctx, input: i32| {
+            let executions = Arc::clone(&handler_executions);
+            async move {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(input + 1)
+            }
+        },
+        WorkflowRegistrationOptions::default(),
+    )
+    .await?;
+    ctx.launch().await?;
+
+    let handle = ctx.retrieve_workflow::<i32>(&workflow_id).await;
+    if handle.get_result(Some(Duration::from_secs(2))).await? != 42 || executions.load(Ordering::SeqCst) != 1 {
+        ctx.shutdown(Duration::from_secs(1)).await;
+        return Err(test_error("launch did not recover a claimed enqueued workflow"));
+    }
+    ctx.shutdown(Duration::from_secs(1)).await;
+    Ok(())
+}
+
+async fn exercise_exact_fork_retry(store: Arc<dyn SystemDatabase>) -> Result<()> {
+    let original_workflow_id = format!("fork-source-{}", Uuid::new_v4());
+    let forked_workflow_id = format!("forked-retry-{}", Uuid::new_v4());
+    let workflow_name = "forked-exact-retry-workflow";
+    let executions = Arc::new(AtomicUsize::new(0));
+    let ctx = DbosContext::new(DbosConfig::new("forked-exact-retry").with_system_database(SystemDatabaseHandle::from_arc(store))).await?;
+    let handler_executions = Arc::clone(&executions);
+    ctx.register_workflow(
+        workflow_name,
+        move |_ctx, input: i32| {
+            let executions = Arc::clone(&handler_executions);
+            async move {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(input + 1)
+            }
+        },
+        WorkflowRegistrationOptions::default(),
+    )
+    .await?;
+    ctx.launch().await?;
+
+    let original = ctx
+        .run_workflow::<_, i32>(
+            workflow_name,
+            41,
+            WorkflowOptions {
+                workflow_id: Some(original_workflow_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if original.get_result(Some(Duration::from_secs(2))).await? != 42 {
+        ctx.shutdown(Duration::from_secs(1)).await;
+        return Err(test_error("fork source workflow did not complete"));
+    }
+
+    let fork_input = ForkWorkflowInput {
+        original_workflow_id,
+        start_step: None,
+        forked_workflow_id: Some(forked_workflow_id),
+        application_version: None,
+    };
+    let first = ctx.fork_workflow::<i32>(fork_input.clone()).await?;
+    let retry = ctx.fork_workflow::<i32>(fork_input).await?;
+    if first.get_result(Some(Duration::from_secs(2))).await? != 42
+        || retry.get_result(Some(Duration::from_secs(2))).await? != 42
+        || executions.load(Ordering::SeqCst) != 2
+    {
+        ctx.shutdown(Duration::from_secs(1)).await;
+        return Err(test_error("an exact fork retry did not execute the fork exactly once"));
+    }
+    ctx.shutdown(Duration::from_secs(1)).await;
+    Ok(())
+}
+
 async fn exercise_import_rejects_existing_workflow(store: Arc<dyn SystemDatabase>) -> Result<()> {
     let workflow_id = format!("import-existing-{}", Uuid::new_v4());
     let ctx = DbosContext::new(DbosConfig::new("import-existing").with_system_database(SystemDatabaseHandle::from_arc(store))).await?;
@@ -403,6 +517,8 @@ async fn memory_workflow_insert_is_idempotent() -> Result<()> {
     exercise_concurrent_workflow_execution(vec![Arc::clone(&store); CONCURRENT_CLIENTS]).await?;
     exercise_exact_retry_after_unclaimed_insert(Arc::clone(&store)).await?;
     exercise_recovery_of_unclaimed_workflow(Arc::clone(&store)).await?;
+    exercise_recovery_of_claimed_enqueued_workflow(Arc::clone(&store)).await?;
+    exercise_exact_fork_retry(Arc::clone(&store)).await?;
     exercise_import_rejects_existing_workflow(store).await
 }
 
@@ -439,6 +555,12 @@ async fn turso_workflow_insert_is_idempotent() -> Result<()> {
         exercise_recovery_of_unclaimed_workflow(Arc::clone(primary))
             .await
             .map_err(|error| test_error_with_source("Turso unclaimed recovery check failed", error))?;
+        exercise_recovery_of_claimed_enqueued_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Turso claimed enqueued recovery check failed", error))?;
+        exercise_exact_fork_retry(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Turso exact fork retry check failed", error))?;
         exercise_import_rejects_existing_workflow(Arc::clone(primary))
             .await
             .map_err(|error| test_error_with_source("Turso import collision check failed", error))
@@ -493,6 +615,12 @@ async fn postgres_workflow_insert_is_idempotent() -> Result<()> {
         exercise_recovery_of_unclaimed_workflow(Arc::clone(primary))
             .await
             .map_err(|error| test_error_with_source("Postgres unclaimed recovery check failed", error))?;
+        exercise_recovery_of_claimed_enqueued_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Postgres claimed enqueued recovery check failed", error))?;
+        exercise_exact_fork_retry(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Postgres exact fork retry check failed", error))?;
         exercise_import_rejects_existing_workflow(Arc::clone(primary))
             .await
             .map_err(|error| test_error_with_source("Postgres import collision check failed", error))

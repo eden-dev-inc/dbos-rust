@@ -37,9 +37,15 @@ pub trait SystemDatabase: Send + Sync {
     /// Atomically assigns one executor the right to start a pending or enqueued workflow.
     ///
     /// Implementations that execute workflows must override this method. The default fails closed rather than allowing duplicate execution.
-    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str) -> Result<bool> {
-        let _ = (workflow_id, executor_id);
+    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str, execution_id: &str) -> Result<bool> {
+        let _ = (workflow_id, executor_id, execution_id);
         Err(DbosError::unsupported("system database does not support atomic workflow execution claims"))
+    }
+    /// Returns whether this store provides the durable execution-claim protocol required by a DBOS context.
+    ///
+    /// External implementations must opt in only after implementing `claim_workflow_execution` with the same atomicity guarantees.
+    fn supports_workflow_execution_claims(&self) -> bool {
+        false
     }
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()>;
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowStatus>>;
@@ -151,6 +157,10 @@ impl MemoryStore {
 
 #[async_trait]
 impl SystemDatabase for MemoryStore {
+    fn supports_workflow_execution_claims(&self) -> bool {
+        true
+    }
+
     async fn migrate(&self) -> Result<()> {
         Ok(())
     }
@@ -182,15 +192,20 @@ impl SystemDatabase for MemoryStore {
         Ok(WorkflowInsertResult::Inserted)
     }
 
-    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str) -> Result<bool> {
+    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str, execution_id: &str) -> Result<bool> {
         let mut data = self.data.write().await;
         let Some(workflow) = data.workflows.get_mut(workflow_id) else {
             return Ok(false);
         };
+        if workflow.execution_id.as_deref() == Some(execution_id) {
+            return Ok(true);
+        }
         if !matches!(workflow.status, WorkflowStatusType::Pending | WorkflowStatusType::Enqueued) || workflow.executor_id.is_some() {
             return Ok(false);
         }
+        workflow.status = WorkflowStatusType::Pending;
         workflow.executor_id = Some(executor_id.to_string());
+        workflow.execution_id = Some(execution_id.to_string());
         workflow.updated_at = Utc::now();
         Ok(true)
     }
@@ -742,6 +757,10 @@ impl PostgresStore {
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl SystemDatabase for PostgresStore {
+    fn supports_workflow_execution_claims(&self) -> bool {
+        true
+    }
+
     async fn migrate(&self) -> Result<()> {
         let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema);
         let create_migrations = format!(
@@ -833,30 +852,46 @@ impl SystemDatabase for PostgresStore {
         Err(DbosError::database("postgres workflow insert retry loop exited unexpectedly"))
     }
 
-    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str) -> Result<bool> {
+    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str, execution_id: &str) -> Result<bool> {
         let updated_at = serde_json::to_value(Utc::now())?;
         let query = format!(
-            "UPDATE {} SET payload = jsonb_set(jsonb_set(payload, '{{executor_id}}', to_jsonb($3::text), true), '{{updated_at}}', $4::jsonb, true), updated_at = now() \
+            "UPDATE {} SET payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{{status}}', to_jsonb('PENDING'::text), true), '{{executor_id}}', to_jsonb($3::text), true), '{{execution_id}}', to_jsonb($4::text), true), '{{updated_at}}', $5::jsonb, true), updated_at = now() \
              WHERE kind = $1 AND id = $2 AND payload->>'status' IN ('PENDING', 'ENQUEUED') \
              AND COALESCE(payload->'executor_id', 'null'::jsonb) = 'null'::jsonb",
             self.state_table()
         );
+        let select_query = format!("SELECT payload FROM {} WHERE kind = $1 AND id = $2", self.state_table());
         for attempt in 0..2 {
             let mut client = self.client.lock().await;
             self.ensure_connected_locked(&mut client).await?;
             let Some(client_ref) = client.as_ref() else {
                 return Err(DbosError::database("postgres client was not initialized"));
             };
-            match client_ref.execute(&query, &[&"workflow", &workflow_id, &executor_id, &updated_at]).await {
-                Ok(updated) => return Ok(updated == 1),
+            match client_ref.execute(&query, &[&"workflow", &workflow_id, &executor_id, &execution_id, &updated_at]).await {
+                Ok(updated) if updated > 0 => return Ok(true),
+                Ok(_) => break,
                 Err(error) if attempt == 0 => {
                     log_database_warning("retrying DBOS postgres workflow execution claim after connection failure", &error);
                     *client = None;
                 }
-                Err(error) => return Err(DbosError::from(error)),
+                Err(error) => {
+                    log_database_warning("resolving DBOS postgres workflow execution claim after connection failure", &error);
+                    *client = None;
+                    break;
+                }
             }
         }
-        Err(DbosError::database("postgres workflow execution claim retry loop exited unexpectedly"))
+        let mut client = self.client.lock().await;
+        self.ensure_connected_locked(&mut client).await?;
+        let Some(client_ref) = client.as_ref() else {
+            return Err(DbosError::database("postgres client was not initialized"));
+        };
+        let existing = client_ref.query_opt(&select_query, &[&"workflow", &workflow_id]).await?;
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        let workflow: WorkflowStatus = serde_json::from_value(existing.get::<_, Value>(0))?;
+        Ok(workflow.execution_id.as_deref() == Some(execution_id))
     }
 
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
@@ -1159,6 +1194,10 @@ impl TursoStore {
 #[cfg(feature = "turso")]
 #[async_trait]
 impl SystemDatabase for TursoStore {
+    fn supports_workflow_execution_claims(&self) -> bool {
+        true
+    }
+
     async fn migrate(&self) -> Result<()> {
         let connection = self.connection.lock().await;
         connection
@@ -1242,7 +1281,7 @@ impl SystemDatabase for TursoStore {
         }
     }
 
-    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str) -> Result<bool> {
+    async fn claim_workflow_execution(&self, workflow_id: &str, executor_id: &str, execution_id: &str) -> Result<bool> {
         let updated_at = Utc::now().to_rfc3339();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut delay = Duration::from_millis(1);
@@ -1251,15 +1290,21 @@ impl SystemDatabase for TursoStore {
                 let connection = self.connection.lock().await;
                 connection
                     .execute(
-                        "UPDATE dbos_state SET payload = json_set(payload, '$.executor_id', ?3, '$.updated_at', ?4), updated_at = CURRENT_TIMESTAMP \
+                        "UPDATE dbos_state SET payload = json_set(payload, '$.status', 'PENDING', '$.executor_id', ?3, '$.execution_id', ?4, '$.updated_at', ?5), updated_at = CURRENT_TIMESTAMP \
                          WHERE kind = ?1 AND id = ?2 AND json_extract(payload, '$.status') IN ('PENDING', 'ENQUEUED') \
                          AND (json_type(payload, '$.executor_id') IS NULL OR json_type(payload, '$.executor_id') = 'null')",
-                        turso::params!["workflow", workflow_id, executor_id, updated_at.clone()],
+                        turso::params!["workflow", workflow_id, executor_id, execution_id, updated_at.clone()],
                     )
                     .await
             };
             match result {
-                Ok(updated) => return Ok(updated == 1),
+                Ok(updated) if updated > 0 => return Ok(true),
+                Ok(_) => {
+                    return Ok(self
+                        .get_workflow(workflow_id)
+                        .await?
+                        .is_some_and(|workflow| workflow.execution_id.as_deref() == Some(execution_id)));
+                }
                 Err(error) if is_retryable_turso_insert_error(&error) && tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_millis(50));

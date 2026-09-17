@@ -360,6 +360,11 @@ impl DbosContext {
         }
 
         let store = build_store(&config).await?;
+        if !store.supports_workflow_execution_claims() {
+            return Err(DbosError::unsupported(
+                "system database must implement atomic workflow execution claims; override SystemDatabase::claim_workflow_execution and supports_workflow_execution_claims",
+            ));
+        }
         let observability = config.observability.clone().unwrap_or_default();
         Ok(Self {
             inner: Arc::new(DbosInner {
@@ -810,6 +815,7 @@ impl DbosContext {
         workflow.completed_at = None;
         workflow.error = None;
         workflow.executor_id = None;
+        workflow.execution_id = None;
         workflow.updated_at = Utc::now();
         self.inner.store.save_workflow(workflow).await?;
         if should_spawn {
@@ -854,6 +860,8 @@ impl DbosContext {
         fork.completed_at = None;
         fork.error = None;
         fork.output = None;
+        fork.executor_id = None;
+        fork.execution_id = None;
         self.inner.store.insert_workflow(fork.clone()).await?;
         self.spawn_workflow_execution(fork.workflow_uuid.clone()).await;
         Ok(WorkflowHandle::new(self.clone(), fork.workflow_uuid))
@@ -1875,7 +1883,8 @@ impl DbosContext {
             return Ok(());
         }
         if workflow.executor_id.is_none() {
-            let claimed = match self.inner.store.claim_workflow_execution(workflow_id, self.executor_id()).await {
+            let execution_id = Uuid::new_v4().to_string();
+            let claimed = match self.inner.store.claim_workflow_execution(workflow_id, self.executor_id(), &execution_id).await {
                 Ok(claimed) => claimed,
                 Err(error) => {
                     operation_guard.finish_error(&error);
@@ -2015,14 +2024,14 @@ impl DbosContext {
     pub async fn recover_pending_workflows(&self, executor_ids: &[String]) -> Result<Vec<WorkflowHandle<Value>>> {
         let workflows = self
             .list_workflows(ListWorkflowsOptions {
-                status: vec![WorkflowStatusType::Pending],
+                status: vec![WorkflowStatusType::Pending, WorkflowStatusType::Enqueued],
                 load_input: true,
                 ..Default::default()
             })
             .await?;
         let mut handles = Vec::new();
         for workflow in workflows {
-            if workflow.executor_id.is_none() {
+            if workflow.status == WorkflowStatusType::Pending && workflow.executor_id.is_none() {
                 self.spawn_workflow_execution(workflow.workflow_uuid.clone()).await;
                 handles.push(WorkflowHandle::new(self.clone(), workflow.workflow_uuid));
             } else if workflow.executor_id.as_ref().is_some_and(|executor_id| executor_ids.contains(executor_id)) {
