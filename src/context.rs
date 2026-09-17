@@ -737,9 +737,9 @@ impl DbosContext {
                     } else if status.queue_name.is_some() {
                         status.status = WorkflowStatusType::Enqueued;
                     }
-                    let insert_result = self.inner.store.insert_workflow(status).await?;
+                    self.inner.store.insert_workflow(status).await?;
 
-                    if insert_result == WorkflowInsertResult::Inserted && options.queue_name.is_none() && options.delay.is_none() {
+                    if options.queue_name.is_none() && options.delay.is_none() {
                         self.spawn_workflow_execution(workflow_id.clone()).await;
                     }
 
@@ -809,6 +809,7 @@ impl DbosContext {
         };
         workflow.completed_at = None;
         workflow.error = None;
+        workflow.executor_id = None;
         workflow.updated_at = Utc::now();
         self.inner.store.save_workflow(workflow).await?;
         if should_spawn {
@@ -853,10 +854,8 @@ impl DbosContext {
         fork.completed_at = None;
         fork.error = None;
         fork.output = None;
-        let insert_result = self.inner.store.insert_workflow(fork.clone()).await?;
-        if insert_result == WorkflowInsertResult::Inserted {
-            self.spawn_workflow_execution(fork.workflow_uuid.clone()).await;
-        }
+        self.inner.store.insert_workflow(fork.clone()).await?;
+        self.spawn_workflow_execution(fork.workflow_uuid.clone()).await;
         Ok(WorkflowHandle::new(self.clone(), fork.workflow_uuid))
     }
 
@@ -946,7 +945,15 @@ impl DbosContext {
     fn import_workflow_inner(&self, export: WorkflowExport) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let workflow_id = export.workflow.workflow_uuid.clone();
-            self.inner.store.insert_workflow(export.workflow).await?;
+            match self.inner.store.insert_workflow_with_result(export.workflow).await? {
+                WorkflowInsertResult::Inserted => {}
+                WorkflowInsertResult::ExistingExact => {
+                    return Err(DbosError::new(
+                        DbosErrorCode::ConflictingWorkflow,
+                        format!("workflow {workflow_id} already exists; refusing to overwrite imported workflow history"),
+                    ));
+                }
+            }
             for step in export.steps {
                 if step.workflow_uuid != workflow_id {
                     return Err(DbosError::invalid_argument(format!(
@@ -1824,16 +1831,24 @@ impl DbosContext {
     }
 
     async fn spawn_workflow_execution(&self, workflow_id: String) {
+        self.spawn_workflow_execution_with_recovery(workflow_id, false).await;
+    }
+
+    async fn spawn_recovered_workflow_execution(&self, workflow_id: String) {
+        self.spawn_workflow_execution_with_recovery(workflow_id, true).await;
+    }
+
+    async fn spawn_workflow_execution_with_recovery(&self, workflow_id: String, resume_existing_claim: bool) {
         let ctx = self.clone();
         let handle = tokio::spawn(async move {
-            if let Err(error) = ctx.execute_workflow(&workflow_id).await {
+            if let Err(error) = ctx.execute_workflow(&workflow_id, resume_existing_claim).await {
                 log_workflow_execution_failed(&workflow_id, &error);
             }
         });
         self.inner.tasks.lock().await.push(handle);
     }
 
-    async fn execute_workflow(&self, workflow_id: &str) -> Result<()> {
+    async fn execute_workflow(&self, workflow_id: &str, resume_existing_claim: bool) -> Result<()> {
         let mut operation_guard = self
             .inner
             .observability
@@ -1859,6 +1874,39 @@ impl DbosContext {
             }
             return Ok(());
         }
+        if workflow.executor_id.is_none() {
+            let claimed = match self.inner.store.claim_workflow_execution(workflow_id, self.executor_id()).await {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    operation_guard.finish_error(&error);
+                    return Err(error);
+                }
+            };
+            if !claimed {
+                operation_guard.finish_success();
+                return Ok(());
+            }
+            workflow = match self
+                .inner
+                .store
+                .get_workflow(workflow_id)
+                .await
+                .and_then(|workflow| workflow.ok_or_else(|| DbosError::non_existent_workflow(workflow_id)))
+            {
+                Ok(workflow) => workflow,
+                Err(error) => {
+                    operation_guard.finish_error(&error);
+                    return Err(error);
+                }
+            };
+            if workflow.status.is_terminal() {
+                operation_guard.finish_success();
+                return Ok(());
+            }
+        } else if !resume_existing_claim || workflow.executor_id.as_deref() != Some(self.executor_id()) {
+            operation_guard.finish_success();
+            return Ok(());
+        }
         let name = workflow.name.clone();
         let executor = match self.resolve_workflow(&name, workflow.config_name.as_deref()).await {
             Ok(executor) => executor,
@@ -1868,7 +1916,6 @@ impl DbosContext {
             }
         };
         workflow.status = WorkflowStatusType::Pending;
-        workflow.executor_id = Some(self.executor_id().to_string());
         workflow.started_at.get_or_insert_with(Utc::now);
         workflow.attempts = workflow.attempts.saturating_add(1);
         workflow.updated_at = Utc::now();
@@ -1975,8 +2022,11 @@ impl DbosContext {
             .await?;
         let mut handles = Vec::new();
         for workflow in workflows {
-            if workflow.executor_id.as_ref().is_some_and(|executor_id| executor_ids.contains(executor_id)) {
+            if workflow.executor_id.is_none() {
                 self.spawn_workflow_execution(workflow.workflow_uuid.clone()).await;
+                handles.push(WorkflowHandle::new(self.clone(), workflow.workflow_uuid));
+            } else if workflow.executor_id.as_ref().is_some_and(|executor_id| executor_ids.contains(executor_id)) {
+                self.spawn_recovered_workflow_execution(workflow.workflow_uuid.clone()).await;
                 handles.push(WorkflowHandle::new(self.clone(), workflow.workflow_uuid));
             }
         }

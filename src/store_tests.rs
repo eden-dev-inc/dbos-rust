@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::*;
 use crate::error::DbosErrorCode;
 use crate::types::WorkflowStatusType;
-use crate::{DbosConfig, DbosContext, WorkflowOptions, WorkflowRegistrationOptions};
+use crate::{DbosConfig, DbosContext, JsonSerializer, StepInfo, WorkflowExport, WorkflowOptions, WorkflowRegistrationOptions};
 
 const CONCURRENT_CLIENTS: usize = 8;
 
@@ -21,6 +21,10 @@ fn workflow(workflow_id: &str, name: &str, input: Value) -> WorkflowStatus {
 
 fn test_error(message: impl Into<String>) -> DbosError {
     DbosError::database(message)
+}
+
+fn test_error_with_source(message: impl Into<String>, source: DbosError) -> DbosError {
+    DbosError::with_source(DbosErrorCode::Database, message, source)
 }
 
 fn expect_conflict(result: Result<WorkflowInsertResult>, case: &str) -> Result<()> {
@@ -49,9 +53,9 @@ async fn exercise_exact_retry_and_mismatches(store: &Arc<dyn SystemDatabase>) ->
     let input = json!({"request": "original"});
     let initial = workflow(&workflow_id, "example-workflow", input.clone());
 
-    assert_eq!(store.insert_workflow(initial.clone()).await?, WorkflowInsertResult::Inserted);
+    assert_eq!(store.insert_workflow_with_result(initial.clone()).await?, WorkflowInsertResult::Inserted);
     assert_eq!(
-        store.insert_workflow(workflow(&workflow_id, "example-workflow", input.clone())).await?,
+        store.insert_workflow_with_result(workflow(&workflow_id, "example-workflow", input.clone())).await?,
         WorkflowInsertResult::ExistingExact
     );
 
@@ -72,19 +76,19 @@ async fn exercise_exact_retry_and_mismatches(store: &Arc<dyn SystemDatabase>) ->
     let expected_terminal = serde_json::to_value(&terminal)?;
 
     assert_eq!(
-        store.insert_workflow(workflow(&workflow_id, "example-workflow", input.clone())).await?,
+        store.insert_workflow_with_result(workflow(&workflow_id, "example-workflow", input.clone())).await?,
         WorkflowInsertResult::ExistingExact
     );
     ensure_workflow_unchanged(store, &workflow_id, &expected_terminal).await?;
 
     expect_conflict(
-        store.insert_workflow(workflow(&workflow_id, "different-workflow", input.clone())).await,
+        store.insert_workflow_with_result(workflow(&workflow_id, "different-workflow", input.clone())).await,
         "workflow name mismatch",
     )?;
     ensure_workflow_unchanged(store, &workflow_id, &expected_terminal).await?;
 
     expect_conflict(
-        store.insert_workflow(workflow(&workflow_id, "example-workflow", json!({"request": "different"}))).await,
+        store.insert_workflow_with_result(workflow(&workflow_id, "example-workflow", json!({"request": "different"}))).await,
         "workflow input mismatch",
     )?;
     ensure_workflow_unchanged(store, &workflow_id, &expected_terminal).await
@@ -103,7 +107,7 @@ async fn exercise_concurrent_exact_retry(stores: &[Arc<dyn SystemDatabase>]) -> 
         let candidate = workflow(&workflow_id, workflow_name, input.clone());
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            store.insert_workflow(candidate).await
+            store.insert_workflow_with_result(candidate).await
         }));
     }
     barrier.wait().await;
@@ -142,7 +146,7 @@ async fn exercise_concurrent_immutable_winner(stores: &[Arc<dyn SystemDatabase>]
         let candidate = workflow(&workflow_id, workflow_name, input.clone());
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            (input, store.insert_workflow(candidate).await)
+            (input, store.insert_workflow_with_result(candidate).await)
         }));
     }
     barrier.wait().await;
@@ -180,7 +184,7 @@ async fn exercise_concurrent_immutable_winner(stores: &[Arc<dyn SystemDatabase>]
     let expected = serde_json::to_value(&persisted)?;
 
     expect_conflict(
-        primary.insert_workflow(workflow(&workflow_id, workflow_name, loser_input)).await,
+        primary.insert_workflow_with_result(workflow(&workflow_id, workflow_name, loser_input)).await,
         "retry of the concurrent mismatch loser",
     )?;
     ensure_workflow_unchanged(primary, &workflow_id, &expected).await
@@ -223,7 +227,6 @@ async fn exercise_concurrent_workflow_execution(stores: Vec<Arc<dyn SystemDataba
             WorkflowRegistrationOptions::default(),
         )
         .await?;
-        ctx.launch().await?;
         contexts.push(ctx);
     }
 
@@ -237,6 +240,7 @@ async fn exercise_concurrent_workflow_execution(stores: Vec<Arc<dyn SystemDataba
             barrier.wait().await;
             ctx.run_workflow::<_, i32>(workflow_name, 41, WorkflowOptions { workflow_id: Some(workflow_id), ..Default::default() })
                 .await
+                .map_err(|error| test_error_with_source("concurrent workflow submission returned an error", error))
         }));
     }
     barrier.wait().await;
@@ -267,7 +271,11 @@ async fn exercise_concurrent_workflow_execution(stores: Vec<Arc<dyn SystemDataba
 
     release_execution.notify_waiters();
     for handle in handles {
-        if handle.get_result(Some(Duration::from_secs(2))).await? != 42 {
+        let result = handle
+            .get_result(Some(Duration::from_secs(2)))
+            .await
+            .map_err(|error| test_error_with_source("concurrent workflow result lookup returned an error", error))?;
+        if result != 42 {
             return Err(test_error("exact workflow retry did not receive the stored result"));
         }
     }
@@ -277,12 +285,125 @@ async fn exercise_concurrent_workflow_execution(stores: Vec<Arc<dyn SystemDataba
     Ok(())
 }
 
+fn stored_workflow_input(input: i32) -> Result<Option<Value>> {
+    Ok(JsonSerializer::encode(&input)?.data.map(Value::String))
+}
+
+async fn exercise_exact_retry_after_unclaimed_insert(store: Arc<dyn SystemDatabase>) -> Result<()> {
+    let workflow_id = format!("unclaimed-exact-retry-{}", Uuid::new_v4());
+    let workflow_name = "unclaimed-exact-retry-workflow";
+    let executions = Arc::new(AtomicUsize::new(0));
+    let ctx =
+        DbosContext::new(DbosConfig::new("unclaimed-exact-retry").with_system_database(SystemDatabaseHandle::from_arc(Arc::clone(&store))))
+            .await?;
+    let handler_executions = Arc::clone(&executions);
+    ctx.register_workflow(
+        workflow_name,
+        move |_ctx, input: i32| {
+            let executions = Arc::clone(&handler_executions);
+            async move {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(input + 1)
+            }
+        },
+        WorkflowRegistrationOptions::default(),
+    )
+    .await?;
+    ctx.launch().await?;
+
+    let mut unclaimed = WorkflowStatus::new(&workflow_id, workflow_name, "test-version", crate::serialization::DBOS_JSON);
+    unclaimed.input = stored_workflow_input(41)?;
+    store.insert_workflow(unclaimed).await?;
+
+    let handle = ctx
+        .run_workflow::<_, i32>(workflow_name, 41, WorkflowOptions { workflow_id: Some(workflow_id), ..Default::default() })
+        .await?;
+    if handle.get_result(Some(Duration::from_secs(2))).await? != 42 || executions.load(Ordering::SeqCst) != 1 {
+        ctx.shutdown(Duration::from_secs(1)).await;
+        return Err(test_error("an exact retry did not claim and execute an unclaimed durable workflow exactly once"));
+    }
+    ctx.shutdown(Duration::from_secs(1)).await;
+    Ok(())
+}
+
+async fn exercise_recovery_of_unclaimed_workflow(store: Arc<dyn SystemDatabase>) -> Result<()> {
+    let workflow_id = format!("unclaimed-recovery-{}", Uuid::new_v4());
+    let workflow_name = "unclaimed-recovery-workflow";
+    let mut unclaimed = WorkflowStatus::new(&workflow_id, workflow_name, "test-version", crate::serialization::DBOS_JSON);
+    unclaimed.input = stored_workflow_input(41)?;
+    store.insert_workflow(unclaimed).await?;
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let ctx = DbosContext::new(DbosConfig::new("unclaimed-recovery").with_system_database(SystemDatabaseHandle::from_arc(store))).await?;
+    let handler_executions = Arc::clone(&executions);
+    ctx.register_workflow(
+        workflow_name,
+        move |_ctx, input: i32| {
+            let executions = Arc::clone(&handler_executions);
+            async move {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(input + 1)
+            }
+        },
+        WorkflowRegistrationOptions::default(),
+    )
+    .await?;
+    ctx.launch().await?;
+
+    let handle = ctx.retrieve_workflow::<i32>(&workflow_id).await;
+    if handle.get_result(Some(Duration::from_secs(2))).await? != 42 || executions.load(Ordering::SeqCst) != 1 {
+        ctx.shutdown(Duration::from_secs(1)).await;
+        return Err(test_error("launch did not recover an unclaimed durable workflow exactly once"));
+    }
+    ctx.shutdown(Duration::from_secs(1)).await;
+    Ok(())
+}
+
+async fn exercise_import_rejects_existing_workflow(store: Arc<dyn SystemDatabase>) -> Result<()> {
+    let workflow_id = format!("import-existing-{}", Uuid::new_v4());
+    let ctx = DbosContext::new(DbosConfig::new("import-existing").with_system_database(SystemDatabaseHandle::from_arc(store))).await?;
+    let export = WorkflowExport {
+        workflow: workflow(&workflow_id, "import-existing-workflow", json!({"request": "original"})),
+        steps: vec![StepInfo {
+            workflow_uuid: workflow_id.clone(),
+            step_id: 0,
+            step_name: "original-step".to_string(),
+            output: Some(json!({"result": "original"})),
+            error: None,
+            child_workflow_id: None,
+            serialization: crate::serialization::DBOS_JSON.to_string(),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+        }],
+        events: Vec::new(),
+        messages: Vec::new(),
+        streams: Vec::new(),
+        children: Vec::new(),
+    };
+    ctx.import_workflow(export.clone()).await?;
+    let mut conflicting_export = export;
+    conflicting_export.steps[0].output = Some(json!({"result": "changed"}));
+    match ctx.import_workflow(conflicting_export).await {
+        Err(error) if error.code == DbosErrorCode::ConflictingWorkflow => {}
+        Err(error) => return Err(test_error(format!("import collision returned {error} instead of ConflictingWorkflow"))),
+        Ok(()) => return Err(test_error("import collision unexpectedly overwrote existing workflow history")),
+    }
+    let steps = ctx.get_workflow_steps(&workflow_id).await?;
+    if steps.len() != 1 || steps[0].output != Some(json!({"result": "original"})) {
+        return Err(test_error("import collision changed existing workflow step history"));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_workflow_insert_is_idempotent() -> Result<()> {
     let store = MemoryStore::shared();
     store.migrate().await?;
     exercise_store(vec![Arc::clone(&store); CONCURRENT_CLIENTS]).await?;
-    exercise_concurrent_workflow_execution(vec![store; CONCURRENT_CLIENTS]).await
+    exercise_concurrent_workflow_execution(vec![Arc::clone(&store); CONCURRENT_CLIENTS]).await?;
+    exercise_exact_retry_after_unclaimed_insert(Arc::clone(&store)).await?;
+    exercise_recovery_of_unclaimed_workflow(Arc::clone(&store)).await?;
+    exercise_import_rejects_existing_workflow(store).await
 }
 
 #[cfg(feature = "turso")]
@@ -305,8 +426,22 @@ async fn turso_workflow_insert_is_idempotent() -> Result<()> {
         }
         let primary = stores.first().ok_or_else(|| test_error("Turso test requires at least one store"))?;
         primary.migrate().await?;
-        exercise_store(stores.clone()).await?;
-        exercise_concurrent_workflow_execution(stores).await
+        exercise_store(stores.clone())
+            .await
+            .map_err(|error| test_error_with_source("Turso store insertion checks failed", error))?;
+        exercise_concurrent_workflow_execution(stores.clone())
+            .await
+            .map_err(|error| test_error_with_source("Turso concurrent execution check failed", error))?;
+        let primary = stores.first().ok_or_else(|| test_error("Turso test requires a primary store"))?;
+        exercise_exact_retry_after_unclaimed_insert(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Turso unclaimed exact-retry check failed", error))?;
+        exercise_recovery_of_unclaimed_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Turso unclaimed recovery check failed", error))?;
+        exercise_import_rejects_existing_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Turso import collision check failed", error))
     }
     .await;
     let cleanup = std::fs::remove_dir_all(&test_directory)
@@ -345,8 +480,22 @@ async fn postgres_workflow_insert_is_idempotent() -> Result<()> {
         for _ in 1..CONCURRENT_CLIENTS {
             stores.push(PostgresStore::connect(&database_url, &schema).await?);
         }
-        exercise_store(stores.clone()).await?;
-        exercise_concurrent_workflow_execution(stores).await
+        exercise_store(stores.clone())
+            .await
+            .map_err(|error| test_error_with_source("Postgres store insertion checks failed", error))?;
+        exercise_concurrent_workflow_execution(stores.clone())
+            .await
+            .map_err(|error| test_error_with_source("Postgres concurrent execution check failed", error))?;
+        let primary = stores.first().ok_or_else(|| test_error("Postgres test requires a primary store"))?;
+        exercise_exact_retry_after_unclaimed_insert(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Postgres unclaimed exact-retry check failed", error))?;
+        exercise_recovery_of_unclaimed_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Postgres unclaimed recovery check failed", error))?;
+        exercise_import_rejects_existing_workflow(Arc::clone(primary))
+            .await
+            .map_err(|error| test_error_with_source("Postgres import collision check failed", error))
     }
     .await;
     let cleanup = drop_postgres_schema(&database_url, &schema).await;
