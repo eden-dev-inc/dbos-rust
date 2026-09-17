@@ -36,6 +36,8 @@ pub struct WorkflowStatus {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub executor_id: Option<String>,
+    #[serde(default)]
+    pub execution_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub application_version: String,
@@ -78,6 +80,7 @@ impl WorkflowStatus {
             output: None,
             error: None,
             executor_id: None,
+            execution_id: None,
             created_at: now,
             updated_at: now,
             application_version: application_version.into(),
