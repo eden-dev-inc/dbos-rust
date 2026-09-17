@@ -31,5 +31,5 @@ pub use error::*;
 pub use observability::DbosObservability;
 pub use observability::DbosTelemetrySnapshot;
 pub use serialization::*;
-pub use store::{MemoryStore, SystemDatabase, SystemDatabaseHandle};
+pub use store::{MemoryStore, SystemDatabase, SystemDatabaseHandle, WorkflowInsertResult};
 pub use types::*;

@@ -26,7 +26,7 @@ use crate::types::{
 pub trait SystemDatabase: Send + Sync {
     async fn migrate(&self) -> Result<()>;
     /// Atomically inserts a workflow, accepting an existing row only when its name and serialized input match exactly.
-    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()>;
+    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<WorkflowInsertResult>;
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()>;
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowStatus>>;
     async fn list_workflows(&self, options: &ListWorkflowsOptions) -> Result<Vec<WorkflowStatus>>;
@@ -65,6 +65,15 @@ pub trait SystemDatabase: Send + Sync {
 
     async fn set_patch(&self, patch_name: &str, active: bool) -> Result<()>;
     async fn get_patch(&self, patch_name: &str) -> Result<Option<bool>>;
+}
+
+/// The durable insertion outcome for a workflow invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowInsertResult {
+    /// This invocation created the durable workflow row.
+    Inserted,
+    /// A prior invocation already created an exactly matching durable workflow row.
+    ExistingExact,
 }
 
 #[derive(Clone)]
@@ -132,7 +141,7 @@ impl SystemDatabase for MemoryStore {
         Ok(())
     }
 
-    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
+    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<WorkflowInsertResult> {
         let mut data = self.data.write().await;
         if let Some(existing) = data.workflows.get(&workflow.workflow_uuid) {
             return ensure_workflow_identity_matches(existing, &workflow);
@@ -152,7 +161,7 @@ impl SystemDatabase for MemoryStore {
             }
         }
         data.workflows.insert(workflow.workflow_uuid.clone(), workflow);
-        Ok(())
+        Ok(WorkflowInsertResult::Inserted)
     }
 
     async fn save_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
@@ -357,9 +366,9 @@ impl SystemDatabase for MemoryStore {
     }
 }
 
-fn ensure_workflow_identity_matches(existing: &WorkflowStatus, requested: &WorkflowStatus) -> Result<()> {
+fn ensure_workflow_identity_matches(existing: &WorkflowStatus, requested: &WorkflowStatus) -> Result<WorkflowInsertResult> {
     if existing.name == requested.name && existing.input == requested.input {
-        return Ok(());
+        return Ok(WorkflowInsertResult::ExistingExact);
     }
     Err(DbosError::new(
         crate::error::DbosErrorCode::ConflictingWorkflow,
@@ -744,7 +753,7 @@ impl SystemDatabase for PostgresStore {
         Err(DbosError::database("postgres migration retry loop exited unexpectedly"))
     }
 
-    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
+    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<WorkflowInsertResult> {
         let payload = serde_json::to_value(&workflow)?;
         let insert_query = format!(
             "INSERT INTO {} (kind, id, payload, updated_at) VALUES ($1, $2, $3, now()) \
@@ -768,7 +777,7 @@ impl SystemDatabase for PostgresStore {
             }
             .await;
             match result {
-                Ok((true, _)) => return Ok(()),
+                Ok((true, _)) => return Ok(WorkflowInsertResult::Inserted),
                 Ok((false, Some(existing_payload))) => {
                     let existing = serde_json::from_value(existing_payload)?;
                     return ensure_workflow_identity_matches(&existing, &workflow);
@@ -1103,7 +1112,7 @@ impl SystemDatabase for TursoStore {
         Ok(())
     }
 
-    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<()> {
+    async fn insert_workflow(&self, workflow: WorkflowStatus) -> Result<WorkflowInsertResult> {
         let payload = serde_json::to_string(&workflow)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut delay = Duration::from_millis(1);
@@ -1136,7 +1145,7 @@ impl SystemDatabase for TursoStore {
                 .await
             };
             match result {
-                Ok((true, _)) => return Ok(()),
+                Ok((true, _)) => return Ok(WorkflowInsertResult::Inserted),
                 Ok((false, Some(existing_payload))) => {
                     let existing = serde_json::from_str(&existing_payload)?;
                     return ensure_workflow_identity_matches(&existing, &workflow);

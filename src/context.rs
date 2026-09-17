@@ -25,7 +25,9 @@ use crate::observability::{
 use crate::serialization::{
     CustomSerializer, DBOS_JSON, EncodedValue, PORTABLE_JSON, decode_stored_with_serializer, encode_json_value, encode_portable,
 };
-use crate::store::{MemoryStore, SystemDatabase, SystemDatabaseHandle, step_counts_by_name, workflow_counts_by_status};
+use crate::store::{
+    MemoryStore, SystemDatabase, SystemDatabaseHandle, WorkflowInsertResult, step_counts_by_name, workflow_counts_by_status,
+};
 use crate::types::{
     CreateScheduleRequest, DeleteWorkflowOptions, ExportWorkflowOptions, ForkWorkflowInput, GetResultOptions, GetStepAggregatesInput,
     GetWorkflowAggregatesInput, GetWorkflowStepsOptions, ListRegisteredWorkflowsOptions, ListSchedulesOptions, ListWorkflowsOptions,
@@ -735,9 +737,9 @@ impl DbosContext {
                     } else if status.queue_name.is_some() {
                         status.status = WorkflowStatusType::Enqueued;
                     }
-                    self.inner.store.insert_workflow(status).await?;
+                    let insert_result = self.inner.store.insert_workflow(status).await?;
 
-                    if options.queue_name.is_none() && options.delay.is_none() {
+                    if insert_result == WorkflowInsertResult::Inserted && options.queue_name.is_none() && options.delay.is_none() {
                         self.spawn_workflow_execution(workflow_id.clone()).await;
                     }
 
@@ -851,8 +853,10 @@ impl DbosContext {
         fork.completed_at = None;
         fork.error = None;
         fork.output = None;
-        self.inner.store.insert_workflow(fork.clone()).await?;
-        self.spawn_workflow_execution(fork.workflow_uuid.clone()).await;
+        let insert_result = self.inner.store.insert_workflow(fork.clone()).await?;
+        if insert_result == WorkflowInsertResult::Inserted {
+            self.spawn_workflow_execution(fork.workflow_uuid.clone()).await;
+        }
         Ok(WorkflowHandle::new(self.clone(), fork.workflow_uuid))
     }
 
