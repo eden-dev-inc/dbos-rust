@@ -44,6 +44,9 @@ type StepAggregateBucket = (BTreeMap<String, Value>, u64, Option<i64>);
 pub struct DbosConfig {
     pub app_name: String,
     pub database_url: Option<String>,
+    /// Trusted CA file for required, certificate- and hostname-verified PostgreSQL.
+    /// The profile is pinned when the store connects and used on every reconnect.
+    pub postgres_ca_file: Option<std::path::PathBuf>,
     pub turso_path: Option<String>,
     pub database_schema: String,
     pub system_database: Option<SystemDatabaseHandle>,
@@ -68,6 +71,7 @@ impl std::fmt::Debug for DbosConfig {
         f.debug_struct("DbosConfig")
             .field("app_name", &self.app_name)
             .field("database_url", &self.database_url)
+            .field("postgres_ca_file", &self.postgres_ca_file)
             .field("turso_path", &self.turso_path)
             .field("database_schema", &self.database_schema)
             .field("system_database", &self.system_database)
@@ -94,6 +98,7 @@ impl DbosConfig {
         Self {
             app_name: app_name.into(),
             database_url: None,
+            postgres_ca_file: None,
             turso_path: None,
             database_schema: "dbos".to_string(),
             system_database: None,
@@ -116,6 +121,13 @@ impl DbosConfig {
 
     pub fn with_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.database_url = Some(database_url.into());
+        self
+    }
+
+    /// Require verified TLS for the PostgreSQL system store, including reconnects.
+    /// There is no plaintext fallback if trust, hostname or handshake validation fails.
+    pub fn with_postgres_ca_file(mut self, ca_file: impl Into<std::path::PathBuf>) -> Self {
+        self.postgres_ca_file = Some(ca_file.into());
         self
     }
 
@@ -2429,7 +2441,8 @@ async fn build_store(config: &DbosConfig) -> Result<Arc<dyn SystemDatabase>> {
         }
         #[cfg(feature = "postgres")]
         {
-            return crate::store::PostgresStore::connect(database_url, &config.database_schema).await;
+            return crate::store::PostgresStore::connect_with_ca(database_url, &config.database_schema, config.postgres_ca_file.as_deref())
+                .await;
         }
         #[cfg(not(feature = "postgres"))]
         {

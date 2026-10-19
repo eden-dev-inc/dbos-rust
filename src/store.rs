@@ -115,6 +115,17 @@ impl SystemDatabaseHandle {
         Ok(Self { store: PostgresStore::connect(database_url, schema).await? })
     }
 
+    /// Connect through required TLS with standard CA/hostname verification.
+    ///
+    /// # Errors
+    /// Returns invalid trust/profile, TLS, authentication and database errors.
+    #[cfg(feature = "postgres")]
+    pub async fn postgres_with_ca(database_url: &str, schema: &str, ca_file: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            store: PostgresStore::connect_with_ca(database_url, schema, Some(ca_file)).await?,
+        })
+    }
+
     #[cfg(feature = "turso")]
     pub async fn turso(path: &str) -> Result<Self> {
         Ok(Self { store: TursoStore::connect(path).await? })
@@ -582,7 +593,7 @@ fn schedule_matches(schedule: &WorkflowSchedule, options: &ListSchedulesOptions)
 
 #[cfg(feature = "postgres")]
 pub(crate) struct PostgresStore {
-    database_url: String,
+    transport: crate::postgres_transport::PostgresTransport,
     client: Mutex<Option<tokio_postgres::Client>>,
     reconnect_timeout: Duration,
     schema: String,
@@ -591,9 +602,17 @@ pub(crate) struct PostgresStore {
 #[cfg(feature = "postgres")]
 impl PostgresStore {
     pub(crate) async fn connect(database_url: &str, schema: &str) -> Result<Arc<dyn SystemDatabase>> {
+        Self::connect_with_ca(database_url, schema, None).await
+    }
+
+    pub(crate) async fn connect_with_ca(
+        database_url: &str,
+        schema: &str,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Arc<dyn SystemDatabase>> {
         validate_schema_name(schema)?;
         let store = Arc::new(Self {
-            database_url: database_url.to_string(),
+            transport: crate::postgres_transport::PostgresTransport::new(database_url, ca_file)?,
             client: Mutex::new(None),
             reconnect_timeout: reconnect_timeout(),
             schema: schema.to_string(),
@@ -614,13 +633,7 @@ impl PostgresStore {
     }
 
     async fn open_client(&self) -> Result<tokio_postgres::Client> {
-        let (client, connection) = tokio_postgres::connect(&self.database_url, tokio_postgres::NoTls).await.map_err(DbosError::from)?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                log_database_warning("dbos postgres connection task exited", &error);
-            }
-        });
-        Ok(client)
+        self.transport.connect().await
     }
 
     async fn ensure_connected_locked(&self, client: &mut Option<tokio_postgres::Client>) -> Result<()> {

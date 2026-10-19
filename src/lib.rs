@@ -18,6 +18,8 @@ mod context;
 mod debouncer;
 mod error;
 mod observability;
+#[cfg(feature = "postgres")]
+mod postgres_transport;
 mod serialization;
 mod store;
 mod types;
